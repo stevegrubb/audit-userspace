@@ -1,0 +1,34 @@
+name: Build and Test
+
+on:
+  pull_request:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:latest
+    steps:
+      - name: Install build dependencies
+        run: |
+          dnf -y update && dnf -y install \
+            make gcc kernel-headers systemd \
+            autoconf automake libtool \
+            libcap-ng-devel krb5-devel \
+            python3-devel python-unversioned-command swig \
+            openldap-devel
+          dnf clean all
+      - name: Checkout code
+        uses: actions/checkout@v3
+      - name: Prepare build
+        run: |
+          autoreconf -fv --install
+          ./configure --with-python3=yes --enable-gssapi-krb5=yes \
+            --with-arm --with-aarch64 --with-libcap-ng=yes \
+            --without-golang --with-io_uring
+      - name: Build
+        run: make -j$(nproc)
+      - name: Run tests
+        run: make check

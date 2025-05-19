@@ -67,6 +67,11 @@ make install
 
 If you are packaging this, you probably want to do "make dist" instead and use the resulting tar file with your package building framework. A spec file is included in the git repo as an example of packaging it using rpm. This spec file is not known to be the official spec file used by any distribution. It's just an example.
 
+CONTINUOUS INTEGRATION
+----------------------
+Pull requests are automatically built and tested using a Fedora-based GitHub Actions workflow. The job installs the dependencies listed in `audit.spec`, runs `autoreconf`, configures the project, and executes `make check` to ensure changes compile and pass the test suite.
+
+
 CROSS COMPILING
 ---------------
 Cross compiling is not officially supported. There have been people that have submitted patches to make it work. But it is not documented how to make it work. It is likely that you have to somehow override CC, CXX, RANLIB, AR, LD, and NM when running configure to pickup the cross compiler, linker, archive, etc. If you have patches that fix any problems, they will be merged. If you have suggestions for how to improve cross compiling documentation, file an issue stating how to improve instructions.

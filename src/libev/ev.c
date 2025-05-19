@@ -4605,11 +4605,14 @@ ev_signal_start (EV_P_ ev_signal *w) EV_NOEXCEPT
 
   if (sigfd >= 0)
     {
-      /* TODO: check .head */
-      sigaddset (&sigfd_set, w->signum);
-      sigprocmask (SIG_BLOCK, &sigfd_set, 0);
+      if (!signals [w->signum - 1].head)
+        {
+          sigaddset (&sigfd_set, w->signum);
+          sigprocmask (SIG_BLOCK, &sigfd_set, 0);
 
-      signalfd (sigfd, &sigfd_set, 0);
+          if (signalfd (sigfd, &sigfd_set, 0) < 0)
+            ev_syserr ("(libev) signalfd");
+        }
     }
 #endif
 
@@ -4618,7 +4621,7 @@ ev_signal_start (EV_P_ ev_signal *w) EV_NOEXCEPT
 
   if (!((WL)w)->next)
 # if EV_USE_SIGNALFD
-    if (sigfd < 0) /*TODO*/
+    if (sigfd < 0)
 # endif
       {
 # ifdef _WIN32
@@ -4674,7 +4677,8 @@ ev_signal_stop (EV_P_ ev_signal *w) EV_NOEXCEPT
           sigaddset (&ss, w->signum);
           sigdelset (&sigfd_set, w->signum);
 
-          signalfd (sigfd, &sigfd_set, 0);
+          if (signalfd (sigfd, &sigfd_set, 0) < 0)
+            ev_syserr ("(libev) signalfd");
           sigprocmask (SIG_UNBLOCK, &ss, 0);
         }
       else

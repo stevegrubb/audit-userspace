@@ -992,7 +992,7 @@ eval_unsigned_value(rnode *record, const struct expr *expr, int *valid)
 	if (expr->virtual_field == 0) {
 		nvlist_first(&record->nv);
 		if (nvlist_find_name(&record->nv, expr->v.p.field.name) == 0)
-			return 0;
+               res = nvlist_interp_cur_val(au, record, au->escape_mode);
 		const char *val = nvlist_get_cur_val(&record->nv);
 		if (val) {
 			uint32_t v = strtoul(val, NULL, 10);

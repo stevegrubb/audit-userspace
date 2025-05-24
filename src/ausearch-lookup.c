@@ -42,6 +42,8 @@ struct nv_pair {
 
 /* The machine based on elf type */
 static int machine = 0;
+static auparse_state_t interp_au;
+static int interp_init = 0;
 static const char *Q = "?";
 static const char *results[3]= { "unset", "denied", "granted" };
 static const char *success[3]= { "unset", "no", "yes" };
@@ -71,14 +73,20 @@ const char *aulookup_success(int s)
 
 const char *aulookup_syscall(llist *l, char *buf, size_t size)
 {
-	const char *sys;
+       const char *sys;
+
+       if (!interp_init) {
+               memset(&interp_au, 0, sizeof(interp_au));
+               init_interpretation_list(&interp_au);
+               interp_init = 1;
+       }
 
 	if (report_format <= RPT_DEFAULT) {
 		snprintf(buf, size, "%d", l->s.syscall);
 		return buf;
 	}
 
-	sys = _auparse_lookup_interpretation("syscall");
+       sys = _auparse_lookup_interpretation(&interp_au, "syscall");
 	if (sys) {
 		snprintf(buf, size, "%s", sys);
 		free((void *)sys);
@@ -194,8 +202,14 @@ static nvlist uid_nvl;
 static int uid_list_created=0;
 const char *aulookup_uid(uid_t uid, char *buf, size_t size)
 {
-	const char *name;
-	int rc;
+       const char *name;
+       int rc;
+
+       if (!interp_init) {
+               memset(&interp_au, 0, sizeof(interp_au));
+               init_interpretation_list(&interp_au);
+               interp_init = 1;
+       }
 
 	if (report_format <= RPT_DEFAULT) {
 		snprintf(buf, size, "%d", uid);
@@ -206,7 +220,7 @@ const char *aulookup_uid(uid_t uid, char *buf, size_t size)
 		return buf;
 	}
 
-	name = _auparse_lookup_interpretation("auid");
+       name = _auparse_lookup_interpretation(&interp_au, "auid");
 	if (name) {
 		snprintf(buf, size, "%s", name);
 		free((void *)name);

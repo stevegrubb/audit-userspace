@@ -32,12 +32,13 @@
 /* Make these hidden to prevent conflicts */
 AUDIT_HIDDEN_START
 
-void init_interpretation_list(void);
-int load_interpretation_list(const char *buf);
-void free_interpretation_list(void);
-unsigned int interpretation_list_cnt(void);
+void init_interpretation_list(auparse_state_t *au);
+int load_interpretation_list(auparse_state_t *au, const char *buf);
+void free_interpretation_list(auparse_state_t *au);
+unsigned int interpretation_list_cnt(const auparse_state_t *au);
 int lookup_type(const char *name);
-const char *do_interpret(rnode *r, auparse_esc_t escape_mode);
+const char *do_interpret(auparse_state_t *au, rnode *r,
+auparse_esc_t escape_mode);
 void _aulookup_destroy_uid_list(void);
 void aulookup_destroy_gid_list(void);
 void aulookup_metrics(unsigned int *uid, unsigned int *gid);

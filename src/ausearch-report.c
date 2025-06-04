@@ -61,18 +61,18 @@ static int loaded = 0;
 
 void ausearch_load_interpretations(const lnode *n)
 {
-	if (loaded == 0) {
-		_auparse_load_interpretations(n->interp);
-		loaded = 1;
-	}
+       if (loaded == 0) {
+               _auparse_load_interpretations(au, n->interp);
+               loaded = 1;
+       }
 }
 
 void ausearch_free_interpretations(void)
 {
-	if (loaded) {
-		_auparse_free_interpretations();
-		loaded = 0;
-	}
+       if (loaded) {
+               _auparse_free_interpretations(au);
+               loaded = 0;
+       }
 }
 
 /* This function branches to the correct output format */
@@ -382,7 +382,7 @@ static void report_interpret(char *name, char *val, int comma, int rtype)
 	id.val = val;
 	id.cwd = NULL;
 
-	char *out = auparse_do_interpretation(type, &id, escape_mode);
+       char *out = auparse_do_interpretation(au, type, &id, escape_mode);
 	if (type == AUPARSE_TYPE_UNCLASSIFIED)
 		printf("%s%c", val, comma ? ',' : ' ');
 	else if (name[0] == 'k' && strcmp(name, "key") == 0) {

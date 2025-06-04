@@ -139,8 +139,7 @@ typedef enum { S_UNSET=-1, S_FAILED, S_SUCCESS } success_t;
 static char *print_escaped(const char *val);
 static const char *print_signals(const char *val, unsigned int base);
 
-// FIXME: move next declaration to auparse_state_t
-static nvlist il;  // Interpretations list
+// Interpretation list moved into auparse_state_t
 
 /*
  * This function will take a pointer to a 2 byte Ascii character buffer and
@@ -399,28 +398,32 @@ char *au_unescape(char *buf)
 
 /////////// Interpretation list functions ///////////////
 #define NEVER_LOADED 0xFFFF
-void init_interpretation_list(void)
+void init_interpretation_list(auparse_state_t *au)
 {
-	nvlist_create(&il);
-	il.cnt = NEVER_LOADED;
+       if (au == NULL)
+               return;
+       nvlist_create(&au->interpretations);
+       au->interpretations.cnt = NEVER_LOADED;
 }
 
 /*
  * Returns 0 on error and 1 on success
  */
-int load_interpretation_list(const char *buffer)
+int load_interpretation_list(auparse_state_t *au, const char *buffer)
 {
 	char *saved = NULL, *ptr;
 	char *buf, *val;
 	nvnode n;
 
-	if (buffer == NULL)
-		return 0;
+       nvlist *il = &au->interpretations;
 
-	if (il.cnt == NEVER_LOADED)
-		il.cnt = 0;
+       if (buffer == NULL)
+               return 0;
 
-	il.record = buf = strdup(buffer);
+       if (il->cnt == NEVER_LOADED)
+               il->cnt = 0;
+
+       il->record = buf = strdup(buffer);
 	if (buf == NULL) {
 		goto err_out;
 	}
@@ -435,7 +438,7 @@ int load_interpretation_list(const char *buffer)
 				// Just change the case
 				n.name = strcpy(buf, "saddr");
 				n.val = val;
-				if (nvlist_append(&il, &n))
+                                if (nvlist_append(il, &n))
 					goto err_out;
 				nvlist_interp_fixup(&il);
 				return 1;
@@ -443,8 +446,8 @@ int load_interpretation_list(const char *buffer)
 		}
 err_out:
 		free(buf);
-		il.record = NULL;
-		il.cnt = NEVER_LOADED;
+                il->record = NULL;
+                il->cnt = NEVER_LOADED;
 		return 0;
 	} else {
 		// We handle everything else in this branch
@@ -475,34 +478,36 @@ err_out:
 				tmp = 0;
 
 			n.val = val;
-			if (nvlist_append(&il, &n))
+                        if (nvlist_append(il, &n))
 				continue; // assuming we loaded something
-			nvlist_interp_fixup(&il);
+                        nvlist_interp_fixup(il);
 			if (ptr)
 				*ptr = tmp;
 		} while ((ptr = audit_strsplit_r(NULL, &saved)));
 	}
 
 	// If for some reason it was useless, delete buf
-	if (il.cnt == 0)
-		goto err_out;
+        if (il->cnt == 0)
+                goto err_out;
 
-	return 1;
+        return 1;
 }
 
 /*
  * Returns malloc'ed buffer on success and NULL if no match
  */
-const char *_auparse_lookup_interpretation(const char *name)
+const char *_auparse_lookup_interpretation(auparse_state_t *au,
+const char *name)
 {
 	nvnode *n;
 
-	if (il.cnt == NEVER_LOADED)
-		return NULL;
+       nvlist *il = &au->interpretations;
 
-	nvlist_first(&il);
-	if (nvlist_find_name(&il, name)) {
-		n = nvlist_get_cur(&il);
+       if (il->cnt == NEVER_LOADED)
+               return NULL;
+       nvlist_first(il);
+       if (nvlist_find_name(il, name)) {
+               n = nvlist_get_cur(il);
 		// This is only called from src/ausearch-lookup.c
 		// it only looks up auid and syscall. One needs
 		// escape, the other does not.
@@ -514,22 +519,26 @@ const char *_auparse_lookup_interpretation(const char *name)
 	return NULL;
 }
 
-void free_interpretation_list(void)
+void free_interpretation_list(auparse_state_t *au)
 {
-	if (il.cnt != NEVER_LOADED) {
-		nvlist_clear(&il, 0);
-		il.cnt = NEVER_LOADED;
-	}
+       nvlist *il = &au->interpretations;
+
+       if (il->cnt != NEVER_LOADED) {
+               nvlist_clear(il, 0);
+               il->cnt = NEVER_LOADED;
+       }
 }
 
 // This uses a sentinel to determine if the list has ever been loaded.
 // If never loaded, returns 0. Otherwise it returns 1 higher than how
 // many interpretations are loaded.
-unsigned int interpretation_list_cnt(void)
+unsigned int interpretation_list_cnt(const auparse_state_t *au)
 {
-	if (il.cnt == NEVER_LOADED)
-		return 0;
-	return il.cnt+1;
+       const nvlist *il = &au->interpretations;
+
+       if (il->cnt == NEVER_LOADED)
+               return 0;
+       return il->cnt + 1;
 }
 
 //////////// Start Field Value Interpretations /////////////
@@ -3234,7 +3243,8 @@ int lookup_type(const char *name)
  * This is the main entry point for the auparse library. Call chain is:
  * auparse_interpret_field -> nvlist_interp_cur_val -> do_interpret
  */
-const char *do_interpret(rnode *r, auparse_esc_t escape_mode)
+const char *do_interpret(auparse_state_t *au, rnode *r,
+auparse_esc_t escape_mode)
 {
 	nvlist *nv = &r->nv;
 	int type;
@@ -3251,7 +3261,7 @@ const char *do_interpret(rnode *r, auparse_esc_t escape_mode)
 	id.val = nvlist_get_cur_val(nv);
 	type = auparse_interp_adjust_type(r->type, id.name, id.val);
 
-	out = auparse_do_interpretation(type, &id, escape_mode);
+       out = auparse_do_interpretation(au, type, &id, escape_mode);
 	n = nvlist_get_cur(nv);
 	n->interp_val = (char *)out;
 
@@ -3322,16 +3332,18 @@ int auparse_interp_adjust_type(int rtype, const char *name, const char *val)
  * This can be called by either interpret() or from ausearch-report or
  * auditctl-listing.c. Returns a malloc'ed buffer that the caller must free.
  */
-char *auparse_do_interpretation(int type, const idata *id,
-	auparse_esc_t escape_mode)
+char *auparse_do_interpretation(auparse_state_t *au, int type,
+const idata *id, auparse_esc_t escape_mode)
 {
 	const char *out;
 
-	// Check the interpretations list first
-	if (interpretation_list_cnt()) {
-		nvlist_first(&il);
-		if (nvlist_find_name(&il, id->name)) {
-			nvnode* node = &il.array[il.cur];
+       nvlist *il = &au->interpretations;
+
+       // Check the interpretations list first
+       if (interpretation_list_cnt(au)) {
+               nvlist_first(il);
+               if (nvlist_find_name(il, id->name)) {
+                       nvnode* node = &il->array[il->cur];
 			const char *val = node->interp_val;
 
 			if (val) {

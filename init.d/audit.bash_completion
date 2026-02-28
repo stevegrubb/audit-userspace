@@ -18,7 +18,8 @@ _aureport_opts="--auth --avc --comm --config --crypto --debug --eoe-timeout \
 _augenrules_opts="--check --load"
 
 _auditctl_opts="-b --backlog_wait_time --reset_backlog_wait_time_actual -c -D \
--e -f -h -i --loginuid-immutable -q -r --reset-lost -R --signal -t -l -m \
+-e -f -h -i --loginuid-immutable -q -r --reset-lost -R \
+--reset_backlog_max_depth --signal -t -l -m \
 -s -v -a -A -C -d -D -F -S -w -W"
 
 _ausearch_complete()

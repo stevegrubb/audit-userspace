@@ -571,6 +571,26 @@ int audit_reset_backlog_wait_time_actual(int fd)
 	return rc;
 }
 
+int audit_reset_backlog_max_depth(int fd)
+{
+	int rc = -1;
+
+#if HAVE_DECL_AUDIT_STATUS_BACKLOG_MAX_DEPTH == 1
+	struct audit_status s;
+	int seq;
+
+	memset(&s, 0, sizeof(s));
+	s.mask          = AUDIT_STATUS_BACKLOG_MAX_DEPTH;
+	s.backlog_max_depth = 0;
+	rc = __audit_send(fd, AUDIT_SET, &s, sizeof(s), &seq);
+	if (rc < 0)
+		audit_msg(audit_priority(errno),
+			"Error sending backlog max depth reset request (%s)",
+			strerror(-rc));
+#endif
+	return rc;
+}
+
 int audit_set_feature(int fd, unsigned feature, unsigned value, unsigned lock)
 {
 #if HAVE_DECL_AUDIT_FEATURE_VERSION == 1

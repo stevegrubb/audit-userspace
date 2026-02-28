@@ -612,6 +612,16 @@ int audit_print_reply(const struct audit_reply *rep, int fd)
 			rep->status->pid, rep->status->rate_limit,
 			rep->status->backlog_limit, rep->status->lost,
 			rep->status->backlog);
+#if HAVE_DECL_AUDIT_STATUS_BACKLOG_MAX_DEPTH == 1
+			// A newer userspace may have been compiled on new
+			// headers and run on an older kernel. On x86, previous
+			// struct audit_status size was 60.
+			if (rep->len == NLMSG_LENGTH(
+						sizeof(struct audit_status))) {
+			  printf("backlog_max_depth %u\n",
+				  rep->status->backlog_max_depth);
+			}
+#endif
 #if HAVE_DECL_AUDIT_VERSION_BACKLOG_WAIT_TIME == 1 || \
     HAVE_DECL_AUDIT_STATUS_BACKLOG_WAIT_TIME == 1
 
@@ -620,12 +630,8 @@ int audit_print_reply(const struct audit_reply *rep, int fd)
 #endif
 #if HAVE_DECL_AUDIT_STATUS_BACKLOG_WAIT_TIME_ACTUAL == 1
 
-			// A newer userspace may have been compiled on new headers
-			// and run on an older kernel.
-			if (rep->len == NLMSG_LENGTH(sizeof(struct audit_status))) {
-			  printf("backlog_wait_time_actual %u\n",
-				  rep->status->backlog_wait_time_actual);
-			}
+			printf("backlog_wait_time_actual %u\n",
+				rep->status->backlog_wait_time_actual);
 #endif
 			printed = 1;
 			break;

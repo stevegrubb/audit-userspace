@@ -158,6 +158,9 @@ static void usage(void)
 #if HAVE_DECL_AUDIT_STATUS_BACKLOG_WAIT_TIME_ACTUAL == 1
      "    --reset_backlog_wait_time_actual  Reset the actual backlog wait time counter\n"
 #endif
+#if HAVE_DECL_AUDIT_STATUS_BACKLOG_MAX_DEPTH == 1
+     "    --reset_backlog_max_depth  Reset the backlog max depth counter\n"
+#endif
      );
 }
 
@@ -625,6 +628,9 @@ static const struct option long_opts[] =
   {"reset_backlog_wait_time_actual", 0, NULL, 4},
 #endif
   {"signal", 1, NULL, 5},
+#if HAVE_DECL_AUDIT_STATUS_BACKLOG_MAX_DEPTH == 1
+  {"reset_backlog_max_depth", 0, NULL, 6},
+#endif
   {NULL, 0, NULL, 0}
 };
 
@@ -1328,7 +1334,30 @@ static int opt_reset_wait_time(opt_handler_params_t *args)
 	}
 #else
 	audit_msg(LOG_ERR,
-			  "reset_backlog_wait_time_actual is not supported on your kernel");
+	    "reset_backlog_wait_time_actual is not supported on your kernel");
+	retval = OPT_ERROR_NO_REPLY;
+#endif
+
+	return retval;
+}
+
+static int opt_reset_max_depth(opt_handler_params_t *args)
+{
+
+	int retval = args->retval, rc;
+
+#if HAVE_DECL_AUDIT_STATUS_BACKLOG_MAX_DEPTH == 1
+	if ((rc = audit_reset_backlog_max_depth(fd)) >= 0) {
+		audit_msg(LOG_INFO, "backlog_max_depth: %u", rc);
+		args->finish = 1;
+		return OPT_SUCCESS_NO_REPLY;
+	} else {
+		audit_number_to_errmsg(rc, long_opts[args->lidx].name);
+		retval = OPT_ERROR_NO_REPLY;
+	}
+#else
+	audit_msg(LOG_ERR,
+		  "reset_backlog_max_depth is not supported on your kernel");
 	retval = OPT_ERROR_NO_REPLY;
 #endif
 
@@ -1398,6 +1427,7 @@ struct {
 	{3, opt_reset_lost},
 	{4, opt_reset_wait_time},
 	{5, opt_send_signal},
+	{6, opt_reset_max_depth},
 };
 
 int handle_option(int option, opt_handler_params_t* args)

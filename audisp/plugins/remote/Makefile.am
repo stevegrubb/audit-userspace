@@ -53,6 +53,17 @@ endif
 
 test_queue_SOURCES = queue.c test-queue.c
 
+if ENABLE_TLS
+check_PROGRAMS += test-tls-helpers
+test_tls_helpers_SOURCES = test-tls-helpers.c
+test_tls_helpers_CFLAGS = $(OPENSSL_CFLAGS)
+test_tls_helpers_LDADD = $(OPENSSL_LIBS)
+if HAVE_ASAN
+test_tls_helpers_CFLAGS += ${ASAN_FLAGS}
+test_tls_helpers_LDFLAGS = ${ASAN_FLAGS}
+endif
+endif
+
 install-data-hook:
 	mkdir -p -m 0750 ${DESTDIR}${plugin_confdir}
 	$(INSTALL_DATA) -D -m 640 ${srcdir}/$(plugin_conf) ${DESTDIR}${plugin_confdir}

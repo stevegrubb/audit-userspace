@@ -77,6 +77,9 @@ typedef struct ev_tcp {
 #endif
 #ifdef HAVE_TLS
 	SSL *ssl;
+	struct ev_timer handshake_timer;
+	struct daemon_conf *config;
+	int in_handshake_chain;
 #endif
 	unsigned char buffer [MAX_AUDIT_MESSAGE_LENGTH + 17];
 } ev_tcp;
@@ -100,6 +103,9 @@ static char *my_service_name, *my_gss_realm;
 #ifdef HAVE_TLS
 static SSL_CTX *tls_server_ctx = NULL;
 #define USE_TLS (transport == T_TLS)
+static struct ev_tcp *handshake_chain = NULL;
+static unsigned int handshake_count = 0;
+#define MAX_HANDSHAKE_PENDING 32
 #endif
 
 static char *sockaddr_to_string(const struct sockaddr_storage *addr)
@@ -186,6 +192,41 @@ static void close_client(struct ev_tcp *client)
 	release_client(client);
 	free(client);
 }
+
+#ifdef HAVE_TLS
+static void abort_handshake(struct ev_loop *loop,
+		struct ev_tcp *client, const char *op)
+{
+	char emsg[DEFAULT_BUF_SZ];
+
+	ev_io_stop(loop, &client->io);
+	ev_timer_stop(loop, &client->handshake_timer);
+	if (client->ssl) {
+		SSL_free(client->ssl);
+		client->ssl = NULL;
+	}
+	shutdown(client->io.fd, SHUT_RDWR);
+	close(client->io.fd);
+
+	if (client->in_handshake_chain) {
+		if (handshake_chain == client)
+			handshake_chain = client->next;
+		if (client->next)
+			client->next->prev = client->prev;
+		if (client->prev)
+			client->prev->next = client->next;
+		handshake_count--;
+		client->in_handshake_chain = 0;
+	}
+
+	snprintf(emsg, sizeof(emsg), "op=%s addr=%s port=%u res=no",
+		op, sockaddr_to_string(&client->addr),
+		sockaddr_to_port(&client->addr));
+	send_audit_event(AUDIT_DAEMON_ACCEPT, emsg);
+
+	free(client);
+}
+#endif
 
 static int ar_write(int sock, const void *buf, int len)
 {
@@ -881,6 +922,28 @@ static int check_num_connections(const struct sockaddr_storage *aaddr)
 		}
 		client = client->next;
 	}
+#ifdef HAVE_TLS
+	client = handshake_chain;
+	while (client) {
+		int rc;
+		struct sockaddr_storage *cl_addr = &client->addr;
+
+		if (aaddr->ss_family == AF_INET)
+			rc = memcmp(&((struct sockaddr_in *)aaddr)->sin_addr,
+				&((struct sockaddr_in *)cl_addr)->sin_addr,
+				sizeof(struct in_addr));
+		else
+			rc = memcmp(&((struct sockaddr_in6 *)aaddr)->sin6_addr,
+				&((struct sockaddr_in6 *)cl_addr)->sin6_addr,
+				sizeof(struct in6_addr));
+		if (rc == 0) {
+			num++;
+			if (num >= max_per_addr)
+				return 1;
+		}
+		client = client->next;
+	}
+#endif
 	return 0;
 }
 
@@ -902,6 +965,105 @@ void write_connection_state(FILE *f)
 		fprintf(f, "total connections = %u\n", num);
 	}
 }
+
+#ifdef HAVE_TLS
+static void tls_handshake_timeout_cb(struct ev_loop *loop,
+		struct ev_timer *w, int revents)
+{
+	struct ev_tcp *client = (struct ev_tcp *)w->data;
+
+	audit_msg(LOG_ERR, "TLS handshake timeout from %s",
+		sockaddr_to_addr(&client->addr));
+	abort_handshake(loop, client, "handshake-timeout");
+}
+
+static void tls_handshake_handler(struct ev_loop *loop,
+		struct ev_io *_io, int revents)
+{
+	struct ev_tcp *client = (struct ev_tcp *)_io;
+	int ret, err;
+	const char *kex_name;
+	char emsg[DEFAULT_BUF_SZ];
+
+	ret = SSL_do_handshake(client->ssl);
+	if (ret == 1) {
+		/* Handshake complete */
+		ev_timer_stop(loop, &client->handshake_timer);
+
+		kex_name = SSL_group_to_name(client->ssl,
+			SSL_get_negotiated_group(client->ssl));
+		audit_msg(LOG_INFO,
+			"TLS connection from %s using %s kex=%s",
+			sockaddr_to_addr(&client->addr),
+			SSL_get_cipher(client->ssl),
+			kex_name ? kex_name : "unknown");
+
+		if (client->config->tls_require_pqc &&
+		    !is_pqc_group(kex_name)) {
+			audit_msg(LOG_ERR,
+				"PQC key exchange required but "
+				"negotiated group '%s' is not PQC "
+				"from %s",
+				kex_name ? kex_name : "unknown",
+				sockaddr_to_addr(&client->addr));
+			abort_handshake(loop, client,
+				"handshake-pqc");
+			return;
+		}
+
+		/* Remove from handshake_chain */
+		if (client->in_handshake_chain) {
+			if (handshake_chain == client)
+				handshake_chain = client->next;
+			if (client->next)
+				client->next->prev = client->prev;
+			if (client->prev)
+				client->prev->next = client->next;
+			handshake_count--;
+			client->in_handshake_chain = 0;
+		}
+
+		/* Switch to data handler */
+		ev_io_stop(loop, &client->io);
+		ev_set_cb(&client->io, auditd_tcp_client_handler);
+		ev_io_modify(&client->io, EV_READ);
+		ev_io_start(loop, &client->io);
+
+		/* Insert into client_chain */
+		client->client_active = 1;
+		client->next = client_chain;
+		client->prev = NULL;
+		if (client->next)
+			client->next->prev = client;
+		client_chain = client;
+
+		snprintf(emsg, sizeof(emsg),
+			"addr=%s port=%u res=success",
+			sockaddr_to_string(&client->addr),
+			sockaddr_to_port(&client->addr));
+		send_audit_event(AUDIT_DAEMON_ACCEPT, emsg);
+		return;
+	}
+
+	err = SSL_get_error(client->ssl, ret);
+	if (err == SSL_ERROR_WANT_READ) {
+		ev_io_stop(loop, &client->io);
+		ev_io_modify(&client->io, EV_READ);
+		ev_io_start(loop, &client->io);
+		return;
+	}
+	if (err == SSL_ERROR_WANT_WRITE) {
+		ev_io_stop(loop, &client->io);
+		ev_io_modify(&client->io, EV_WRITE);
+		ev_io_start(loop, &client->io);
+		return;
+	}
+
+	audit_msg(LOG_ERR, "TLS handshake from %s failed",
+		sockaddr_to_addr(&client->addr));
+	abort_handshake(loop, client, "handshake-error");
+}
+#endif
 
 static void auditd_tcp_listen_handler( struct ev_loop *loop,
 	struct ev_io *_io, int revents)
@@ -998,22 +1160,33 @@ static void auditd_tcp_listen_handler( struct ev_loop *loop,
 
 #ifdef HAVE_TLS
 	if (USE_TLS && tls_server_ctx) {
-		struct timeval tv;
-		const char *kex_name;
+		struct daemon_conf *lconfig =
+			(struct daemon_conf *)_io->data;
 
-		tv.tv_sec = 5;
-		tv.tv_usec = 0;
-		setsockopt(afd, SOL_SOCKET, SO_RCVTIMEO,
-			&tv, sizeof(tv));
-		setsockopt(afd, SOL_SOCKET, SO_SNDTIMEO,
-			&tv, sizeof(tv));
+		if (handshake_count >= MAX_HANDSHAKE_PENDING) {
+			audit_msg(LOG_ERR,
+				"TLS handshake limit reached, "
+				"rejecting %s",
+				sockaddr_to_addr(&aaddr));
+			snprintf(emsg, sizeof(emsg),
+				"op=handshake-limit addr=%s port=%u "
+				"res=no",
+				sockaddr_to_string(&aaddr),
+				sockaddr_to_port(&aaddr));
+			send_audit_event(AUDIT_DAEMON_ACCEPT, emsg);
+			shutdown(afd, SHUT_RDWR);
+			close(afd);
+			free(client);
+			return;
+		}
+
+		fcntl(afd, F_SETFL, O_NONBLOCK | O_NDELAY);
 
 		client->ssl = SSL_new(tls_server_ctx);
 		if (client->ssl == NULL ||
-		    SSL_set_fd(client->ssl, afd) != 1 ||
-		    SSL_accept(client->ssl) != 1) {
+		    SSL_set_fd(client->ssl, afd) != 1) {
 			audit_msg(LOG_ERR,
-				"TLS handshake from %s failed",
+				"TLS setup for %s failed",
 				sockaddr_to_addr(&aaddr));
 			if (client->ssl) {
 				SSL_free(client->ssl);
@@ -1024,31 +1197,30 @@ static void auditd_tcp_listen_handler( struct ev_loop *loop,
 			free(client);
 			return;
 		}
+		SSL_set_accept_state(client->ssl);
 
-		kex_name = SSL_group_to_name(client->ssl,
-			SSL_get_negotiated_group(client->ssl));
-		audit_msg(LOG_INFO,
-			"TLS connection from %s using %s kex=%s",
-			sockaddr_to_addr(&aaddr),
-			SSL_get_cipher(client->ssl),
-			kex_name ? kex_name : "unknown");
+		client->config = lconfig;
+		client->client_active = 0;
+		client->in_handshake_chain = 0;
 
-		if (config->tls_require_pqc &&
-		    !is_pqc_group(kex_name)) {
-			audit_msg(LOG_ERR,
-				"PQC key exchange required but "
-				"negotiated group '%s' is not PQC "
-				"from %s",
-				kex_name ? kex_name : "unknown",
-				sockaddr_to_addr(&aaddr));
-			SSL_shutdown(client->ssl);
-			SSL_free(client->ssl);
-			client->ssl = NULL;
-			shutdown(afd, SHUT_RDWR);
-			close(afd);
-			free(client);
-			return;
-		}
+		ev_io_init(&client->io, tls_handshake_handler,
+			afd, EV_READ);
+		ev_timer_init(&client->handshake_timer,
+			tls_handshake_timeout_cb, 5.0, 0.0);
+		client->handshake_timer.data = client;
+
+		/* Track in handshake_chain */
+		client->next = handshake_chain;
+		client->prev = NULL;
+		if (client->next)
+			client->next->prev = client;
+		handshake_chain = client;
+		handshake_count++;
+		client->in_handshake_chain = 1;
+
+		ev_io_start(loop, &client->io);
+		ev_timer_start(loop, &client->handshake_timer);
+		return;
 	}
 #endif
 #ifdef USE_GSSAPI
@@ -1380,6 +1552,7 @@ int auditd_tcp_listen_init(struct ev_loop *loop, struct daemon_conf *config)
 
 		ev_io_init(&tcp_listen_watcher, auditd_tcp_listen_handler,
 				listen_socket[nlsocks], EV_READ);
+		tcp_listen_watcher.data = config;
 		ev_io_start(loop, &tcp_listen_watcher);
 non_fatal:
 		nlsocks++;
@@ -1475,6 +1648,8 @@ void auditd_tcp_listen_uninit(struct ev_loop *loop, struct daemon_conf *config)
 	}
 
 #ifdef HAVE_TLS
+	while (handshake_chain)
+		abort_handshake(loop, handshake_chain, "shutdown");
 	if (tls_server_ctx) {
 		SSL_CTX_free(tls_server_ctx);
 		tls_server_ctx = NULL;

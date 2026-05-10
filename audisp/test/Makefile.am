@@ -28,7 +28,7 @@ if HAVE_ASAN
 AM_CFLAGS += ${ASAN_FLAGS}
 AM_LDFLAGS += ${ASAN_FLAGS}
 endif
-check_PROGRAMS = audisp-queue-test audisp-llist-test
+check_PROGRAMS = audisp-queue-test audisp-llist-test pconfig-alloc-test
 TESTS = $(check_PROGRAMS)
 
 audisp_queue_test_SOURCES = test-queue.c
@@ -39,3 +39,4 @@ audisp_llist_test_SOURCES = test-audispd-llist.c
 audisp_llist_test_LDADD = ${top_builddir}/audisp/libdisp.la \
 	${top_builddir}/common/libaucommon.la
 
+pconfig_alloc_test_SOURCES = pconfig_alloc_test.c

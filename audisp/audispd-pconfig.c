@@ -75,6 +75,16 @@ static int format_parser(struct nv_pair *nv, int line,
 		plugin_conf_t *config);
 static int sanity_check(plugin_conf_t *config, const char *file);
 
+/*
+ * Report an allocation failure for a plugin config field.
+ * Returns 1 for parser failure handling.
+ */
+static int report_oom(const char *field, int line)
+{
+	audit_msg(LOG_ERR, "Out of memory setting %s - line %d", field, line);
+	return 1;
+}
+
 static const struct kw_pair keywords[] =
 {
   {"active",                   active_parser,			0 },
@@ -237,6 +247,8 @@ int load_pconfig(plugin_conf_t *config, int dirfd, char *file)
 		if (nv.values == NULL) {
 			nv_free(&nv);
 			fclose(f);
+			free_pconfig(config);
+			clear_pconfig(config);
 			return 1;
 		}
 
@@ -248,6 +260,8 @@ int load_pconfig(plugin_conf_t *config, int dirfd, char *file)
 				nv.name, lineno, file);
 			nv_free(&nv);
 			fclose(f);
+			free_pconfig(config);
+			clear_pconfig(config);
 			return 1;
 		}
 
@@ -262,6 +276,8 @@ int load_pconfig(plugin_conf_t *config, int dirfd, char *file)
 				nv.name, lineno, file);
 			nv_free(&nv);
 			fclose(f);
+			free_pconfig(config);
+			clear_pconfig(config);
 			return 1;
 		}
 
@@ -270,6 +286,8 @@ int load_pconfig(plugin_conf_t *config, int dirfd, char *file)
 		if (rc != 0) {
 			nv_free(&nv);
 			fclose(f);
+			free_pconfig(config);
+			clear_pconfig(config);
 			return 1; // local parser puts message out
 		}
 		nv_free(&nv);
@@ -278,8 +296,17 @@ int load_pconfig(plugin_conf_t *config, int dirfd, char *file)
 
 	fclose(f);
 	config->name = strdup(basename(file));
-	if (lineno > 1)
-		return sanity_check(config, file);
+	if (config->name == NULL) {
+		audit_msg(LOG_ERR, "Out of memory setting plugin name");
+		free_pconfig(config);
+		clear_pconfig(config);
+		return 1;
+	}
+	if (lineno > 1 && sanity_check(config, file)) {
+		free_pconfig(config);
+		clear_pconfig(config);
+		return 1;
+	}
 	return 0;
 }
 
@@ -341,11 +368,18 @@ static int nv_split(char *buf, struct nv_pair *nv)
 
 	/* get the value part */
 	while ((ptr = strtok_r(NULL, " ", &saved)) != NULL) {
-		nv->values = realloc(nv->values, (nv->nvalues + 1) * sizeof(char *));
-		if (nv->values == NULL) {
+		char **values;
+
+		values = realloc(nv->values,
+				 (nv->nvalues + 1) * sizeof(char *));
+		if (values == NULL) {
+			free(nv->values);
+			nv->values = NULL;
+			nv->nvalues = 0;
 			return 1;
 		}
 
+		nv->values = values;
 		nv->values[nv->nvalues++] = ptr;
 	}
 	/* Check if at least 1 value was present */
@@ -401,17 +435,24 @@ static int path_parser(struct nv_pair *nv, int line,
 	}
 
 	if (strncasecmp(nv->values[0], "builtin_", 8) == 0) {
+		char *path;
+
 		audit_msg(LOG_WARNING,
 			  "Option %s line %d is obsolete - using %s",
 			  nv->values[0], line, BUILTIN_PATH);
-		config->path = strdup(BUILTIN_PATH);
+		path = strdup(BUILTIN_PATH);
+		if (path == NULL)
+			return report_oom("path", line);
+		free((void *)config->path);
+		config->path = path;
 		return 0;
 	}
 
 	/* get dir form name. */
 	tdir = strdup(nv->values[0]);
-	if (tdir)
-		dir = dirname(tdir);
+	if (tdir == NULL)
+		return report_oom("path", line);
+	dir = dirname(tdir);
 	if (dir == NULL || strlen(dir) < 4) { //  '/var' is shortest dirname
 		audit_msg(LOG_ERR,
 			"The directory name: %s is too short - line %d",
@@ -421,10 +462,11 @@ static int path_parser(struct nv_pair *nv, int line,
 	}
 
 	free((void *)tdir);
+	tdir = strdup(nv->values[0]);
+	if (tdir == NULL)
+		return report_oom("path", line);
 	free((void *)config->path);
-	config->path = strdup(nv->values[0]);
-	if (config->path == NULL)
-		return 1;
+	config->path = tdir;
 	return 0;
 }
 
@@ -451,13 +493,28 @@ static int service_type_parser(struct nv_pair *nv, int line,
 static int args_parser(struct nv_pair *nv, int line,
 	plugin_conf_t *config)
 {
-	config->args = calloc(nv->nvalues, sizeof(char *));
-	config->nargs = nv->nvalues;
+	char **args;
+	int i;
 
-	for (int i = 0; i < nv->nvalues; i++) {
-		config->args[i] = strdup(nv->values[nv->nvalues - i - 1]);
+	args = calloc(nv->nvalues, sizeof(char *));
+	if (args == NULL)
+		return report_oom("args", line);
+
+	for (i = 0; i < nv->nvalues; i++) {
+		args[i] = strdup(nv->values[nv->nvalues - i - 1]);
+		if (args[i] == NULL) {
+			while (i > 0)
+				free(args[--i]);
+			free(args);
+			return report_oom("args", line);
+		}
 	}
 
+	for (i = 0; i < config->nargs; i++)
+		free(config->args[i]);
+	free(config->args);
+	config->args = args;
+	config->nargs = nv->nvalues;
 	return 0;
 }
 

@@ -57,9 +57,12 @@ volatile ATOMIC_INT disp_hup = 0;
 
 /* Local data */
 static daemon_conf_t daemon_config;
+static daemon_conf_t saved_daemon_config;
+static int saved_daemon_config_valid = 0;
 static conf_llist plugin_conf;
 static pthread_t outbound_thread;
 static int need_queue_depth_change = 0;
+static int saved_need_queue_depth_change = 0;
 
 /* Local function prototypes */
 static void signal_plugins(int sig);
@@ -68,6 +71,67 @@ static int safe_exec(plugin_conf_t *conf);
 static void *outbound_thread_main(void *arg);
 static int write_to_plugin(event_t *e, const char *string, size_t string_len,
 			   lnode *conf) __attr_access ((__read_only__, 2, 3));
+
+/*
+ * Free dispatcher-owned string fields in config.
+ * Returns nothing.
+ */
+static void free_disp_config(daemon_conf_t *config)
+{
+	free(config->plugin_dir);
+	config->plugin_dir = NULL;
+}
+
+/*
+ * Save daemon_config before staging reload values.
+ * Returns 0 on success and 1 on allocation failure.
+ */
+static int save_daemon_config(void)
+{
+	if (saved_daemon_config_valid)
+		return 0;
+
+	saved_daemon_config = daemon_config;
+	saved_daemon_config.plugin_dir = NULL;
+	if (daemon_config.plugin_dir) {
+		saved_daemon_config.plugin_dir =
+					strdup(daemon_config.plugin_dir);
+		if (saved_daemon_config.plugin_dir == NULL)
+			return 1;
+	}
+	saved_need_queue_depth_change = need_queue_depth_change;
+	saved_daemon_config_valid = 1;
+	return 0;
+}
+
+/*
+ * Drop the saved dispatcher config after a successful reload.
+ * Returns nothing.
+ */
+static void discard_saved_daemon_config(void)
+{
+	if (!saved_daemon_config_valid)
+		return;
+	free_disp_config(&saved_daemon_config);
+	saved_need_queue_depth_change = 0;
+	saved_daemon_config_valid = 0;
+}
+
+/*
+ * Restore daemon_config after a failed reload.
+ * Returns nothing.
+ */
+static void restore_daemon_config(void)
+{
+	if (!saved_daemon_config_valid)
+		return;
+	free_disp_config(&daemon_config);
+	daemon_config = saved_daemon_config;
+	need_queue_depth_change = saved_need_queue_depth_change;
+	memset(&saved_daemon_config, 0, sizeof(saved_daemon_config));
+	saved_need_queue_depth_change = 0;
+	saved_daemon_config_valid = 0;
+}
 
 /*
  * Handle child plugins when they exit
@@ -101,9 +165,10 @@ static int count_dots(const char *s)
 	return cnt;
 }
 
-static void load_plugin_conf(conf_llist *plugin)
+static int load_plugin_conf(conf_llist *plugin)
 {
 	DIR *d;
+	int failures = 0;
 
 	/* init plugin list */
 	plist_create(plugin);
@@ -114,7 +179,7 @@ static void load_plugin_conf(conf_llist *plugin)
 		int dfd = dirfd(d);
 		if (dfd < 0) {
 			closedir(d);
-			return;
+			return 1;
 		}
 
 		struct dirent *e;
@@ -146,16 +211,21 @@ static void load_plugin_conf(conf_llist *plugin)
 					    "Failed adding %s plugin to list",
 								e->d_name);
 						free_pconfig(&config);
+						failures = 1;
 					}
 				} else
 					free_pconfig(&config);
-			} else
+			} else {
 				audit_msg(LOG_ERR,
 					"Skipping %s plugin due to errors",
 					e->d_name);
+				failures = 1;
+			}
 		}
 		closedir(d);
-	}
+	} else
+		failures = 1;
+	return failures;
 }
 
 static int start_one_plugin(lnode *conf)
@@ -204,23 +274,32 @@ static int start_plugins(conf_llist *plugin)
 	return active;
 }
 
-static void copy_config(const struct daemon_conf *c)
+/*
+ * Copy the audit daemon dispatcher settings into daemon_config.
+ * Returns 0 on success and 1 on allocation failure.
+ */
+static int copy_config(const struct daemon_conf *c)
 {
+	char *plugin_dir = NULL;
+
+	if (c->plugin_dir) {
+		plugin_dir = strdup(c->plugin_dir);
+		if (plugin_dir == NULL) {
+			audit_msg(LOG_ERR,
+				  "Cannot duplicate dispatcher plugin_dir");
+			return 1;
+		}
+	}
+
 	if (c->q_depth > daemon_config.q_depth)
 		need_queue_depth_change = 1;
 
 	daemon_config.q_depth = c->q_depth;
 	daemon_config.overflow_action = c->overflow_action;
 	daemon_config.max_restarts = c->max_restarts;
-	if (daemon_config.plugin_dir == NULL)
-		daemon_config.plugin_dir =
-				c->plugin_dir ? strdup(c->plugin_dir) : NULL;
-	else if (daemon_config.plugin_dir && c->plugin_dir &&
-		strcmp(daemon_config.plugin_dir, c->plugin_dir)) {
-		free(daemon_config.plugin_dir);
-		daemon_config.plugin_dir = strdup(c->plugin_dir);
-	} // else c->plugin_dir is NULL or they are the same
-	  // Either way, let's leave them alone.
+	free(daemon_config.plugin_dir);
+	daemon_config.plugin_dir = plugin_dir;
+	return 0;
 }
 
 static int reconfigure(void)
@@ -234,12 +313,6 @@ static int reconfigure(void)
 	 * so we can rebuild the list in place without additional locking.
 	 */
 
-	if (need_queue_depth_change) {
-		need_queue_depth_change = 0;
-		increase_queue_depth(daemon_config.q_depth);
-	}
-	reset_suspended();
-
 	/* The idea for handling SIGHUP to children goes like this:
 	 * 1) load the current config in temp list
 	 * 2) mark all in real list unchecked
@@ -250,7 +323,25 @@ static int reconfigure(void)
 	 * 7) If no change, send sighup to non-builtins and mark done
 	 * 8) Finally, scan real list for unchecked, terminate and deactivate
 	 */
-	load_plugin_conf(&tmp_plugin);
+	if (load_plugin_conf(&tmp_plugin)) {
+		audit_msg(LOG_ERR,
+			"Plugin configuration reload failed, keeping old state");
+		restore_daemon_config();
+		plist_first(&tmp_plugin);
+		tpconf = plist_get_cur(&tmp_plugin);
+		while (tpconf) {
+			free_pconfig(tpconf->p);
+			tpconf = plist_next(&tmp_plugin);
+		}
+		plist_clear(&tmp_plugin);
+		return plist_count_active(&plugin_conf);
+	}
+	discard_saved_daemon_config();
+	if (need_queue_depth_change) {
+		need_queue_depth_change = 0;
+		increase_queue_depth(daemon_config.q_depth);
+	}
+	reset_suspended();
 	plist_mark_all_unchecked(&plugin_conf);
 
 	plist_first(&tmp_plugin);
@@ -360,7 +451,8 @@ int libdisp_init(const struct daemon_conf *c)
 	int i;
 
 	/* Init the dispatcher's config */
-	copy_config(c);
+	if (copy_config(c))
+		return 1;
 
 	/* Load all plugin configs */
 	load_plugin_conf(&plugin_conf);
@@ -685,7 +777,15 @@ void libdisp_reconfigure(const struct daemon_conf *c)
 	if (plist_count(&plugin_conf) == 0)
 		libdisp_init(c);
 	else { // Otherwise we do a reconfigure
-			copy_config(c);
+			if (save_daemon_config()) {
+				audit_msg(LOG_ERR,
+					  "Cannot save dispatcher config");
+				return;
+			}
+			if (copy_config(c)) {
+				restore_daemon_config();
+				return;
+			}
 			AUDIT_ATOMIC_STORE(disp_hup, 1);
 			nudge_queue();
 	}
@@ -706,7 +806,7 @@ void libdisp_resume(void)
 /* Used during startup and something failed */
 void libdisp_shutdown(void)
 {
+	discard_saved_daemon_config();
 	AUDIT_ATOMIC_STORE(stop, 1);
 	libdisp_nudge_queue();
 }
-

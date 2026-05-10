@@ -149,6 +149,37 @@ static int report_interval_parser(const struct nv_pair *nv, int line,
 		struct daemon_conf *config);
 static int sanity_check(struct daemon_conf *config);
 
+/*
+ * Report an allocation failure for a config field.
+ * Returns 1 for parser failure handling.
+ */
+static int report_oom(const char *field, int line)
+{
+	if (line > 0)
+		audit_msg(LOG_ERR, "Out of memory setting %s - line %d",
+			  field, line);
+	else
+		audit_msg(LOG_ERR, "Out of memory setting %s", field);
+	return 1;
+}
+
+/*
+ * Replace a string config field after successfully duplicating value.
+ * Returns 0 on success and 1 on allocation failure.
+ */
+static int replace_string(const char **field, const char *value,
+			  const char *name, int line)
+{
+	char *tmp;
+
+	tmp = strdup(value);
+	if (tmp == NULL)
+		return report_oom(name, line);
+	free((void *)*field);
+	*field = tmp;
+	return 0;
+}
+
 static const struct kw_pair keywords[] =
 {
   {"local_events",             local_events_parser,		0},
@@ -285,11 +316,19 @@ void set_allow_links(int allow)
 
 int set_config_dir(const char *val)
 {
-	config_dir = strdup(val);
-	if (config_dir == NULL)
+	char *dir, *file;
+
+	dir = strdup(val);
+	if (dir == NULL)
 		return 1;
-	if (asprintf(&config_file, "%s/auditd.conf", config_dir) < 0)
+	if (asprintf(&file, "%s/auditd.conf", dir) < 0) {
+		free(dir);
 		return 1;
+	}
+	free((void *)config_dir);
+	free(config_file);
+	config_dir = dir;
+	config_file = file;
 	return 0;
 }
 
@@ -358,9 +397,16 @@ int load_config(struct daemon_conf *config, log_test_t lt)
 	char buf[512];
 
 	clear_config(config);
+	if (config->log_file == NULL || config->action_mail_acct == NULL ||
+	    config->plugin_dir == NULL) {
+		audit_msg(LOG_ERR, "Out of memory setting default config");
+		return 1;
+	}
 	log_test = lt;
 	if (config_file == NULL)
 		config_file = strdup(CONFIG_FILE);
+	if (config_file == NULL)
+		return report_oom("config file", 0);
 
 	/* open the file */
 	mode = O_RDONLY;
@@ -621,8 +667,9 @@ static int log_file_parser(const struct nv_pair *nv, int line,
 
 	/* get dir from name. */
 	tdir = strdup(nv->value);
-	if (tdir)
-		dir = dirname(tdir);
+	if (tdir == NULL)
+		return report_oom("log_file", line);
+	dir = dirname(tdir);
 	if (dir == NULL || strlen(dir) < 4) { //  '/var' is shortest dirname
 		audit_msg(LOG_ERR, 
 			"The directory name: %s is too short - line %d", 
@@ -683,11 +730,7 @@ static int log_file_parser(const struct nv_pair *nv, int line,
 	}
 
 finish_up:
-	free((void *)config->log_file);
-	config->log_file = strdup(nv->value);
-	if (config->log_file == NULL)
-		return 1;
-	return 0;
+	return replace_string(&config->log_file, nv->value, "log_file", line);
 }
 
 static int num_logs_parser(const struct nv_pair *nv, int line, 
@@ -762,11 +805,12 @@ static int name_parser(const struct nv_pair *nv, int line,
 		struct daemon_conf *config)
 {
 	audit_msg(LOG_DEBUG, "name_parser called with: %s", nv->value);
-	if (nv->value == NULL)
+	if (nv->value == NULL) {
+		free((void *)config->node_name);
 		config->node_name = NULL;
-	else
-		config->node_name = strdup(nv->value);
-	return 0;
+		return 0;
+	}
+	return replace_string(&config->node_name, nv->value, "name", line);
 }
 
 static int max_log_size_parser(const struct nv_pair *nv, int line,
@@ -858,7 +902,11 @@ static int max_log_size_action_parser(const struct nv_pair *nv, int line,
 			if (size_actions[i].option == SZ_EXEC) {
 				if (check_exe_name(nv->option, line))
 					return 1;
-				config->max_log_file_exe = strdup(nv->option);
+				if (replace_string(&config->max_log_file_exe,
+						  nv->option,
+						  "max_log_file_action",
+						  line))
+					return 1;
 			}
 			config->max_log_size_action = size_actions[i].option;
 			return 0;
@@ -1044,7 +1092,10 @@ static int space_action_parser(const struct nv_pair *nv, int line,
 			} else if (failure_actions[i].option == FA_EXEC) {
 				if (check_exe_name(nv->option, line))
 					return 1;
-				config->space_left_exe = strdup(nv->option);
+				if (replace_string(&config->space_left_exe,
+						  nv->option,
+						  "space_left_action", line))
+					return 1;
 			} else if (failure_actions[i].option == FA_HALT) {
 				audit_msg(LOG_ERR,
 					"The HALT option in space_left_action has been deprecated"
@@ -1240,8 +1291,11 @@ static int admin_space_left_action_parser(const struct nv_pair *nv, int line,
 			} else if (failure_actions[i].option == FA_EXEC) {
 				if (check_exe_name(nv->option, line))
 					return 1;
-				config->admin_space_left_exe = 
-							strdup(nv->option);
+				if (replace_string(&config->admin_space_left_exe,
+						  nv->option,
+						  "admin_space_left_action",
+						  line))
+					return 1;
 			}
 			config->admin_space_left_action = 
 						failure_actions[i].option;
@@ -1269,7 +1323,10 @@ static int disk_full_action_parser(const struct nv_pair *nv, int line,
 			} else if (failure_actions[i].option == FA_EXEC) {
 				if (check_exe_name(nv->option, line))
 					return 1;
-				config->disk_full_exe = strdup(nv->option);
+				if (replace_string(&config->disk_full_exe,
+						  nv->option,
+						  "disk_full_action", line))
+					return 1;
 			}
 			config->disk_full_action = failure_actions[i].option;
 			return 0;
@@ -1297,7 +1354,10 @@ static int disk_error_action_parser(const struct nv_pair *nv, int line,
 			} else if (failure_actions[i].option == FA_EXEC) {
 				if (check_exe_name(nv->option, line))
 					return 1;
-				config->disk_error_exe = strdup(nv->option);
+				if (replace_string(&config->disk_error_exe,
+						  nv->option,
+						  "disk_error_action", line))
+					return 1;
 			}
 			config->disk_error_action = failure_actions[i].option;
 			return 0;
@@ -1709,7 +1769,9 @@ static int krb5_principal_parser(const struct nv_pair *nv, int line,
 		"GSSAPI support is not enabled, ignoring value at line %d",
 		line);
 #else
-	config->krb5_principal = strdup(nv->value);
+	if (replace_string(&config->krb5_principal, nv->value,
+			   "krb5_principal", line))
+		return 1;
 #endif
 	return 0;
 }
@@ -1723,7 +1785,9 @@ static int krb5_key_file_parser(const struct nv_pair *nv, int line,
 		"GSSAPI support is not enabled, ignoring value at line %d",
 		line);
 #else
-	config->krb5_key_file = strdup(nv->value);
+	if (replace_string(&config->krb5_key_file, nv->value,
+			   "krb5_key_file", line))
+		return 1;
 #endif
 	return 0;
 }
@@ -1995,7 +2059,11 @@ static int sanity_check(struct daemon_conf *config)
 	if (config->log_group != 0) {
 		int rc = 0;
 		char *path = strdup(config->log_file);
-		const char *dir = dirname(path);
+		const char *dir;
+
+		if (path == NULL)
+			return report_oom("log_file", 0);
+		dir = dirname(path);
 		if (dir && strcmp(dir, "/var/log") == 0) {
 			audit_msg(LOG_ERR,
 				  "Error - log_file is directly in %s and chgrp"
@@ -2056,6 +2124,7 @@ void free_config(struct daemon_conf *config)
 	free((void *)config->krb5_key_file);
 	free((void *)config->plugin_dir);
 	free((void *)config_dir);
+	config_dir = NULL;
 	free(config_file);
         config_file = NULL;
 	config->config_dir = NULL;
@@ -2081,7 +2150,9 @@ int resolve_node(struct daemon_conf *config)
 				char *p;
 				while ((p = strchr(tmp_name, ' ')))
 				       *p = '_';
-				config->node_name = strdup(tmp_name);
+				if (replace_string(&config->node_name, tmp_name,
+						   "node_name", 0))
+					rc = -1;
 			}
 			break;
 		case N_USER:
@@ -2112,7 +2183,10 @@ int resolve_node(struct daemon_conf *config)
 					rc = -1;
 					break;
 				}
-				config->node_name = strdup(ai->ai_canonname);
+				if (replace_string(&config->node_name,
+						   ai->ai_canonname,
+						   "node_name", 0))
+					rc = -1;
 				freeaddrinfo(ai);
 			}
 			break;
@@ -2147,7 +2221,9 @@ int resolve_node(struct daemon_conf *config)
 		(void *) &((struct sockaddr_in6 *)ai->ai_addr)->sin6_addr,
 						tmp_name, INET6_ADDRSTRLEN);
 				freeaddrinfo(ai);
-				config->node_name = strdup(tmp_name);
+				if (replace_string(&config->node_name, tmp_name,
+						   "node_name", 0))
+					rc = -1;
 			}
 			break;
 	}

@@ -1031,7 +1031,7 @@ static void auparse_destroy_common(auparse_state_t *au)
 		fclose(au->in);
 		au->in = NULL;
 	}
-       free_interpretation_list(au);
+	free_interpretation_list(au);
 	clear_normalizer(&au->norm_data);
 	au_lol_clear(au->au_lo, 0);
 	free((void *)au->tmp_translation);
@@ -1041,6 +1041,9 @@ static void auparse_destroy_common(auparse_state_t *au)
 
 void auparse_destroy(auparse_state_t *au)
 {
+	if (au == NULL)
+		return;
+
 	_aulookup_destroy_uid_list(au);
 	aulookup_destroy_gid_list(au);
 

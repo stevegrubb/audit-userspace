@@ -26,12 +26,9 @@
 
 #include "auditd-config.h"
 
-int dispatcher_pid(void);
-void dispatcher_reaped(void);
 int init_dispatcher(const struct daemon_conf *config);
 void shutdown_dispatcher(void);
 void reconfigure_dispatcher(const struct daemon_conf *config);
 int dispatch_event(const struct audit_reply *rep, int protocol_ver);
 
 #endif
-

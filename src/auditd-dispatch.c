@@ -36,16 +36,6 @@
 #include "libdisp.h"
 
 
-int dispatcher_pid(void)
-{
-	return 0;
-}
-
-void dispatcher_reaped(void)
-{
-	shutdown_dispatcher();
-}
-
 /* This function returns 1 on error & 0 on success */
 int init_dispatcher(const struct daemon_conf *config)
 {
@@ -97,4 +87,3 @@ int dispatch_event(const struct audit_reply *rep, int protocol_ver)
 	}
 	return libdisp_enqueue(e);
 }
-

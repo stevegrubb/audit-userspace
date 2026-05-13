@@ -185,7 +185,12 @@ static void user2_handler( struct ev_loop *loop, struct ev_signal *sig, int reve
 }
 
 /*
- * Used with email alerts and max_log_size_exec to cleanup
+ * Reap children started by auditd.
+ *
+ * The max_log_file_action helper is the only child whose completion resumes
+ * audit logging. Plugin children are reaped here to avoid zombies, but plugin
+ * restart and shutdown are handled by the dispatcher during normal event
+ * processing.
  */
 static void child_handler(struct ev_loop *loop, struct ev_signal *sig,
 			int revents)
@@ -193,18 +198,11 @@ static void child_handler(struct ev_loop *loop, struct ev_signal *sig,
 	int pid;
 
 	while ((pid = waitpid(-1, NULL, WNOHANG)) > 0) {
-		if (pid == dispatcher_pid())
-			dispatcher_reaped();
-		else if (pid == auditd_get_exec_pid()) {
+		if (pid == auditd_get_exec_pid()) {
 			resume_logging();
 			auditd_clear_exec_pid();
 		}
 	}
-}
-
-static void child_handler2( int sig )
-{
-	child_handler(NULL, NULL, 0);
 }
 
 #ifdef HAVE_MALLINFO2
@@ -714,6 +712,7 @@ static void close_pipes(void)
 int main(int argc, char *argv[])
 {
 	struct sigaction sa;
+	sigset_t sigchld_mask;
 	struct rlimit limit;
 	int i, c, rc;
 	static const struct option opts[] = {
@@ -800,9 +799,16 @@ int main(int argc, char *argv[])
 	for (i=1; i<NSIG; i++)
 		sigaction( i, &sa, NULL );
 
-	/* This signal handler gets replaced later. Its here in case
-	 * the dispatcher exits before libev is in control */
-	sa.sa_handler = child_handler2;
+	/*
+	 * Keep SIGCHLD pending until libev owns it. Startup can fork before
+	 * ev_signal_start(), for example max_log_file_action helpers and
+	 * dispatcher plugins, and reaping them in a raw signal handler would
+	 * run non-async-safe cleanup.
+	 */
+	sigemptyset(&sigchld_mask);
+	sigaddset(&sigchld_mask, SIGCHLD);
+	pthread_sigmask(SIG_BLOCK, &sigchld_mask, NULL);
+	sa.sa_handler = SIG_DFL;
 	sigaction(SIGCHLD, &sa, NULL);
 
 	atexit(clean_exit);
@@ -1067,6 +1073,7 @@ int main(int argc, char *argv[])
 
 	ev_signal_init (&sigchld_watcher, child_handler, SIGCHLD);
 	ev_signal_start (loop, &sigchld_watcher);
+	pthread_sigmask(SIG_UNBLOCK, &sigchld_mask, NULL);
 
 	ev_signal_init (&sigcont_watcher, cont_handler, SIGCONT);
 	ev_signal_start (loop, &sigcont_watcher);

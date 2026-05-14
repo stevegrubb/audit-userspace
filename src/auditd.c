@@ -894,13 +894,17 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
-	/* Startup libev. If we are not aggregating events, use the select
-	 * backend which is faster for small numbers of descriptors. This
-	 * will fallback to the epoll backend otherwise. */
+	/* Startup libev. Without remote aggregation, select is fastest for
+	 * auditd's small fixed descriptor set. With remote aggregation, poll
+	 * avoids epoll's extra bookkeeping while still handling the modest
+	 * number of expected client sockets.
+	 */
 	{
 	int flags = EVFLAG_NOENV;
 	if (config.tcp_listen_port == 0)
 		flags |= EVBACKEND_SELECT;
+	else
+		flags |= EVBACKEND_POLL;
 	loop = ev_default_loop(flags);
 	}
 

@@ -30,14 +30,11 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include <string.h>
-#include <time.h>
-#include <sys/time.h>
 #include <sys/vfs.h>
 #include <ctype.h>	/* toupper */
 #include <libgen.h>	/* dirname */
 #include "auditd-event.h"
-#include "auditd-dispatch.h"
-#include "auditd-listen.h"
+#include "auditd-reconfigure.h"
 #include "libaudit.h"
 #include "private.h"
 #include "auparse.h"
@@ -51,7 +48,6 @@ extern ATOMIC_INT stop;
 extern volatile ATOMIC_INT stop;
 #endif
 
-extern void update_report_timer(unsigned int interval);
 /*
  * This function is provided by auditd.c and marked weak so test utilities
  * that don't link auditd.c can still link this file.
@@ -75,6 +71,7 @@ static void shift_logs(void);
 static int  open_audit_log(void);
 static pid_t safe_exec(const char *exe);
 static void reconfigure(struct auditd_event *e);
+static int get_log_fd(void);
 static void init_flush_thread(void);
 
 /* Local Data */
@@ -1529,311 +1526,45 @@ static pid_t safe_exec(const char *exe)
 	_exit(EXIT_FAILURE); // Avoid running the atexit handlers
 }
 
-static void reconfigure(struct auditd_event *e)
+/*
+ * get_log_fd - Return the current audit log file descriptor.
+ *
+ * Returns: The current audit log file descriptor.
+ */
+static int get_log_fd(void)
 {
-	struct daemon_conf *nconf = e->reply.conf;
-	struct daemon_conf *oconf = config;
-	uid_t uid = nconf->sender_uid;
-	pid_t pid = nconf->sender_pid;
-	const char *ctx = nconf->sender_ctx;
-	struct timeval tv;
-	char txt[MAX_AUDIT_MESSAGE_LENGTH];
-	char date[40];
-	unsigned int seq_num;
-	int need_size_check = 0, need_reopen = 0, need_space_check = 0;
-
-	snprintf(txt, sizeof(txt),
-		"config change requested by pid=%d auid=%u subj=%s",
-		pid, uid, ctx);
-	audit_msg(LOG_NOTICE, "%s", txt);
-
-	/* Do the reconfiguring. These are done in a specific
-	 * order from least invasive to most invasive. We will
-	 * start with general system parameters. */
-
-	// start with disk error action.
-	oconf->disk_error_action = nconf->disk_error_action;
-	free((char *)oconf->disk_error_exe);
-	oconf->disk_error_exe = nconf->disk_error_exe;
-	disk_err_warning = 0;
-
-	// number of logs
-	oconf->num_logs = nconf->num_logs;
-
-	// flush freq
-	oconf->freq = nconf->freq;
-
-	// priority boost
-	if (oconf->priority_boost != nconf->priority_boost) {
-		oconf->priority_boost = nconf->priority_boost;
-		errno = 0;
-		if (nice(-oconf->priority_boost))
-			; /* Intentionally blank, we have to check errno */
-		if (errno)
-			audit_msg(LOG_WARNING, "Cannot change priority in "
-					"reconfigure (%s)", strerror(errno));
-	}
-
-	// log format
-	oconf->log_format = nconf->log_format;
-
-	// Only update this if we are in background mode since
-	// foreground mode writes to stderr.
-	if ((oconf->write_logs != nconf->write_logs) &&
-				(oconf->daemonize == D_BACKGROUND)) {
-		oconf->write_logs = nconf->write_logs;
-		need_reopen = 1;
-	}
-
-	// log_group
-	if (oconf->log_group != nconf->log_group) {
-		oconf->log_group = nconf->log_group;
-		need_reopen = 1;
-	}
-
-	// action_mail_acct
-	if (strcmp(oconf->action_mail_acct, nconf->action_mail_acct)) {
-		free((void *)oconf->action_mail_acct);
-		oconf->action_mail_acct = nconf->action_mail_acct;
-	} else
-		free((void *)nconf->action_mail_acct);
-
-	// node_name
-	if (oconf->node_name_format != nconf->node_name_format ||
-			(oconf->node_name && nconf->node_name &&
-			strcmp(oconf->node_name, nconf->node_name) != 0)) {
-		oconf->node_name_format = nconf->node_name_format;
-		free((char *)oconf->node_name);
-		oconf->node_name = nconf->node_name;
-	}
-
-	// network listener
-	auditd_tcp_listen_reconfigure(nconf, oconf);
-
-	// distribute network events
-	oconf->distribute_network_events = nconf->distribute_network_events;
-
-	// Dispatcher items
-	oconf->q_depth = nconf->q_depth;
-	oconf->overflow_action = nconf->overflow_action;
-	oconf->max_restarts = nconf->max_restarts;
-	if (nconf->plugin_dir) {
-		if (!oconf->plugin_dir ||
-				strcmp(oconf->plugin_dir,
-					nconf->plugin_dir) != 0) {
-			char *tmp = strdup(nconf->plugin_dir);
-
-			if (tmp == NULL)
-				audit_msg(LOG_ERR,
-				"Cannot duplicate plugin_dir in reconfigure");
-			else {
-				free(oconf->plugin_dir);
-				oconf->plugin_dir = tmp;
-			}
-		}
-	} else if (oconf->plugin_dir) {
-		free(oconf->plugin_dir);
-		oconf->plugin_dir = NULL;
-	}
-	if (nconf->plugin_dir == oconf->plugin_dir)
-		nconf->plugin_dir = NULL;
-	else {
-		free(nconf->plugin_dir);
-		nconf->plugin_dir = NULL;
-	}
-
-	/* At this point we will work on the items that are related to
-	 * a single log file. */
-
-	// max logfile action
-	if (oconf->max_log_size_action != nconf->max_log_size_action) {
-		oconf->max_log_size_action = nconf->max_log_size_action;
-		need_size_check = 1;
-	}
-
-	// max log size
-	if (oconf->max_log_size != nconf->max_log_size) {
-		oconf->max_log_size = nconf->max_log_size;
-		need_size_check = 1;
-	}
-
-	// max log exe
-	if (oconf->max_log_file_exe || nconf->max_log_file_exe) {
-		if (nconf->max_log_file_exe == NULL)
-                       ;
-		else if (oconf->max_log_file_exe == NULL && nconf->max_log_file_exe)
-			need_size_check = 1;
-		else if (strcmp(oconf->max_log_file_exe,
-				nconf->max_log_file_exe))
-			need_size_check = 1;
-		free((char *)oconf->max_log_file_exe);
-		oconf->max_log_file_exe = nconf->max_log_file_exe;
-	}
-
-	if (need_size_check) {
-		logging_suspended = 0;
-		check_log_file_size();
-	}
-
-	// flush technique
-	if (oconf->flush != nconf->flush) {
-		oconf->flush = nconf->flush;
-		need_reopen = 1;
-	}
-
-	// logfile
-	if (strcmp(oconf->log_file, nconf->log_file)) {
-		free((void *)oconf->log_file);
-		oconf->log_file = nconf->log_file;
-		need_reopen = 1;
-		need_space_check = 1; // might be on new partition
-	} else
-		free((void *)nconf->log_file);
-
-	if (need_reopen) {
-		if (log_file)
-			fclose(log_file);
-		log_file = NULL;
-		fix_disk_permissions();
-		if (open_audit_log()) {
-			int saved_errno = errno;
-			audit_msg(LOG_ERR,
-				"Could not reopen a log after reconfigure");
-			logging_suspended = 1;
-			// Likely errors: ENOMEM, ENOSPC
-			do_disk_error_action("reconfig", saved_errno);
-		} else {
-			logging_suspended = 0;
-			check_log_file_size();
-		}
-	}
-
-	/* At this point we will start working on items that are
-	 * related to the amount of space on the partition. */
-
-	// space left
-	if (oconf->space_left != nconf->space_left) {
-		oconf->space_left = nconf->space_left;
-		need_space_check = 1;
-	}
-
-	// space left percent
-	if (oconf->space_left_percent != nconf->space_left_percent) {
-		oconf->space_left_percent = nconf->space_left_percent;
-		need_space_check = 1;
-	}
-
-	// space left action
-	if (oconf->space_left_action != nconf->space_left_action) {
-		oconf->space_left_action = nconf->space_left_action;
-		need_space_check = 1;
-	}
-
-	// space left exe
-	if (oconf->space_left_exe || nconf->space_left_exe) {
-		if (nconf->space_left_exe == NULL)
-			; /* do nothing if new one is blank */
-		else if (oconf->space_left_exe == NULL && nconf->space_left_exe)
-			need_space_check = 1;
-		else if (strcmp(oconf->space_left_exe, nconf->space_left_exe))
-			need_space_check = 1;
-		free((char *)oconf->space_left_exe);
-		oconf->space_left_exe = nconf->space_left_exe;
-	}
-
-	// admin space left
-	if (oconf->admin_space_left != nconf->admin_space_left) {
-		oconf->admin_space_left = nconf->admin_space_left;
-		need_space_check = 1;
-	}
-
-	// admin space left percent
-	if (oconf->admin_space_left_percent != nconf->admin_space_left_percent){
-		oconf->admin_space_left_percent =
-					nconf->admin_space_left_percent;
-		need_space_check = 1;
-	}
-
-	// admin space action
-	if (oconf->admin_space_left_action != nconf->admin_space_left_action) {
-		oconf->admin_space_left_action = nconf->admin_space_left_action;
-		need_space_check = 1;
-	}
-
-	// admin space left exe
-	if (oconf->admin_space_left_exe || nconf->admin_space_left_exe) {
-		if (nconf->admin_space_left_exe == NULL)
-			; /* do nothing if new one is blank */
-		else if (oconf->admin_space_left_exe == NULL &&
-					 nconf->admin_space_left_exe)
-			need_space_check = 1;
-		else if (strcmp(oconf->admin_space_left_exe,
-					nconf->admin_space_left_exe))
-			need_space_check = 1;
-		free((char *)oconf->admin_space_left_exe);
-		oconf->admin_space_left_exe = nconf->admin_space_left_exe;
-	}
-	// disk full action
-	if (oconf->disk_full_action != nconf->disk_full_action) {
-		oconf->disk_full_action = nconf->disk_full_action;
-		need_space_check = 1;
-	}
-
-	// disk full exe
-	if (oconf->disk_full_exe || nconf->disk_full_exe) {
-		if (nconf->disk_full_exe == NULL)
-			; /* do nothing if new one is blank */
-		else if (oconf->disk_full_exe == NULL && nconf->disk_full_exe)
-			need_space_check = 1;
-		else if (strcmp(oconf->disk_full_exe, nconf->disk_full_exe))
-			need_space_check = 1;
-		free((char *)oconf->disk_full_exe);
-		oconf->disk_full_exe = nconf->disk_full_exe;
-	}
-
-	// report interval
-	if (oconf->report_interval != nconf->report_interval) {
-		oconf->report_interval = nconf->report_interval;
-		update_report_timer(oconf->report_interval);
-	}
-
-	if (need_space_check) {
-		/* note save suspended flag, then do space_left. If suspended
-		 * is still 0, then copy saved suspended back. This avoids
-		 * having to call check_log_file_size to restore it. */
-		int saved_suspend = logging_suspended;
-
-		setup_percentages(oconf, AUDIT_ATOMIC_LOAD(log_fd));
-		fs_space_warning = 0;
-		fs_admin_space_warning = 0;
-		fs_space_left = 1;
-		logging_suspended = 0;
-		check_excess_logs();
-		check_space_left();
-		if (logging_suspended == 0)
-			logging_suspended = saved_suspend;
-	}
-
-	reconfigure_dispatcher(oconf);
-
-	// Next document the results
-	srand(time(NULL));
-	seq_num = rand()%10000;
-	if (gettimeofday(&tv, NULL) == 0) {
-		snprintf(date, sizeof(date), "audit(%lld.%03u:%u)",
-			 (long long int)tv.tv_sec, (unsigned)(tv.tv_usec/1000),
-			 seq_num);
-	} else {
-		snprintf(date, sizeof(date),
-			"audit(%lld.%03d:%u)", (long long int)time(NULL),
-			 0, seq_num);
-        }
-
-	e->reply.type = AUDIT_DAEMON_CONFIG;
-	e->reply.len = snprintf(e->reply.msg.data, MAX_AUDIT_MESSAGE_LENGTH-2,
-	"%s: op=reconfigure state=changed auid=%u pid=%d subj=%s res=success",
-		date, uid, pid, ctx );
-	e->reply.message = e->reply.msg.data;
-	free((char *)ctx);
+	return AUDIT_ATOMIC_LOAD(log_fd);
 }
 
+/*
+ * reconfigure - Build the context and apply a reconfigure event.
+ * @e: Audit daemon reconfigure event carrying the new configuration.
+ *
+ * Returns: None.
+ */
+static void reconfigure(struct auditd_event *e)
+{
+	struct auditd_reconfigure_context ctx = {
+		.event = e,
+		.config = config,
+		.state = {
+			.log_file = &log_file,
+			.disk_err_warning = &disk_err_warning,
+			.fs_space_warning = &fs_space_warning,
+			.fs_admin_space_warning = &fs_admin_space_warning,
+			.fs_space_left = &fs_space_left,
+			.logging_suspended = &logging_suspended,
+		},
+		.ops = {
+			.check_log_file_size = check_log_file_size,
+			.check_space_left = check_space_left,
+			.fix_disk_permissions = fix_disk_permissions,
+			.check_excess_logs = check_excess_logs,
+			.do_disk_error_action = do_disk_error_action,
+			.open_audit_log = open_audit_log,
+			.get_log_fd = get_log_fd,
+		},
+	};
+
+	auditd_reconfigure(&ctx);
+}
